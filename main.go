@@ -10,6 +10,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -17,8 +18,20 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/jinzhu/gorm"
 	_ "github.com/mattn/go-sqlite3"
+	"github.com/spf13/viper"
 	"gopkg.in/go-playground/validator.v9"
 )
+
+// Configuration parameters
+type Config struct {
+	DBFile   string `validate:"required"`
+	Port     int    `validate:"required,gt=1024"`
+	LogFile  string `validate:"required"`
+	DataDir  string `validate:"required"`
+	ExecFile string `validate:"required"`
+	TLSKey   string `validate:"required"`
+	TLSCert  string `validate:"required"`
+}
 
 // Used for validation of some fields of the payload
 type Data struct {
@@ -32,10 +45,20 @@ type BuildInfo struct {
 	Data string `gorm:"type:text;not null"`
 }
 
+// IsNotExist Helper function to determine if a path does not exit
+func IsNotExist(path string) bool {
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		// not exist
+		return true
+	}
+	// exist
+	return false
+}
+
 // Initialize database
 func InitDb() *gorm.DB {
 	// Openning file
-	db, err := gorm.Open("sqlite3", *dbFile)
+	db, err := gorm.Open("sqlite3", conf.DBFile)
 
 	// Disable plural table names
 	db.SingularTable(true)
@@ -147,7 +170,7 @@ func PostData(c *gin.Context) {
 	jsonOut.WriteString("\n")
 
 	// Write json data to file
-	outFile := fmt.Sprintf("%s/%s.json", *dataDir, tmp.Ticket)
+	outFile := fmt.Sprintf("%s/%s.json", conf.DataDir, tmp.Ticket)
 	writeErr := ioutil.WriteFile(outFile, jsonOut.Bytes(), 0644)
 	if writeErr != nil {
 		errorMsg := fmt.Sprintf("Unable to create %s", outFile)
@@ -178,7 +201,7 @@ func PostData(c *gin.Context) {
 
 	// Execute deployment
 	jsonFile := fmt.Sprintf("JSON_FILE=%s", outFile)
-	cmd := exec.Command(*execFile)
+	cmd := exec.Command(conf.ExecFile)
 	cmd.Env = append(os.Environ(),
 		jsonFile,
 	)
@@ -195,23 +218,72 @@ func PostData(c *gin.Context) {
 }
 
 var (
-	dbFile   = flag.String("dbfile", "api.db", "Database file")
-	port     = flag.Int("port", 8080, "TCP port to listen on")
-	logFile  = flag.String("logfile", "api.log", "Log file")
-	dataDir  = flag.String("datadir", "/tmp", "Directory for json file")
-	execFile = flag.String("exec", "", "Program to execute against json file")
-
+	conf     Config
 	validate *validator.Validate
 )
 
 func main() {
+	configFile := flag.String("config", "", "Config file")
 	flag.Parse()
 
-	if *execFile == "" {
-		log.Fatal("the -exec parameter is required")
+	if *configFile == "" {
+		log.Fatal("the -config parameter is required")
+	}
+
+	// Verify config file exists
+	if IsNotExist(*configFile) {
+		log.Fatalf("ERROR: config file %s does not exist.\n", *configFile)
+	}
+
+	fmt.Printf("Using config: %s\n\n", *configFile)
+
+	viper.SetConfigFile(*configFile)
+	if err := viper.ReadInConfig(); err != nil {
+		log.Fatalf("Error reading config file, %s", err)
+	}
+
+	err := viper.Unmarshal(&conf)
+	if err != nil {
+		log.Fatalf("unable to decode into struct, %v", err)
 	}
 
 	validate = validator.New()
+	err = validate.Struct(conf)
+	if err != nil {
+		for _, err := range err.(validator.ValidationErrors) {
+			if err.Tag() == "required" {
+				fmt.Printf("Value for %s is required.\n", strings.ToLower(err.Field()))
+			} else if err.Tag() == "gt" {
+				fmt.Printf("Value for %s (%d) needs to be greater than %s.\n", strings.ToLower(err.Field()), err.Value(), err.Param())
+			} else {
+				fmt.Printf("Value for %s (%s) needs to be %s.\n", strings.ToLower(err.Field()), err.Value(), err.Tag())
+			}
+		}
+		log.Fatalf("Unable to continue due to validation error(s).")
+	}
+
+	// Verify files exist
+	// NOTE: DBFile and LogFile get created, verify their parent directories exist
+	dbFileDir := filepath.Dir(conf.DBFile)
+	if IsNotExist(dbFileDir) {
+		log.Fatalf("ERROR: directory %s for dbfile does not exist.", dbFileDir)
+	}
+	logFileDir := filepath.Dir(conf.LogFile)
+	if IsNotExist(logFileDir) {
+		log.Fatalf("ERROR: directory %s for logfile does not exist.", logFileDir)
+	}
+	if IsNotExist(conf.DataDir) {
+		log.Fatalf("ERROR: directory %s for datadir does not exist.", conf.DataDir)
+	}
+	if IsNotExist(conf.ExecFile) {
+		log.Fatalf("ERROR: file %s does not exist.\n", conf.ExecFile)
+	}
+	if IsNotExist(conf.TLSKey) {
+		log.Fatalf("ERROR: file %s does not exist.\n", conf.TLSKey)
+	}
+	if IsNotExist(conf.TLSCert) {
+		log.Fatalf("ERROR: file %s does not exist.\n", conf.TLSCert)
+	}
 
 	// Disable debug mode
 	gin.SetMode(gin.ReleaseMode)
@@ -220,7 +292,7 @@ func main() {
 	gin.DisableConsoleColor()
 
 	// Create stdout log
-	logStdout, _ := os.OpenFile(*logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	logStdout, _ := os.OpenFile(conf.LogFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	gin.DefaultWriter = io.MultiWriter(logStdout)
 
 	// Create a router with default logger and recovery (crash-free) middleware
@@ -240,6 +312,6 @@ func main() {
 	}
 
 	// Listen for requests
-	listenOn := fmt.Sprintf(":%d", *port)
-	r.Run(listenOn)
+	listenOn := fmt.Sprintf(":%d", conf.Port)
+	r.RunTLS(listenOn, conf.TLSCert, conf.TLSKey)
 }
